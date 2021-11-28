@@ -1,6 +1,8 @@
 import time
 import socket
 import threading
+import tkinter as tk
+from tkinter import filedialog
 from crc import CrcCalculator, Crc32
 crc_calculator = CrcCalculator(Crc32.CRC32)
 console_lock = threading.Lock()
@@ -12,10 +14,12 @@ class PacketDatabase:
 
 
 class Comm:
-    def __init__(self, com_ip, com_port):
-        self.ip = ip
-        self.port = port
+    def __init__(self, com_ip, com_port, file_name=None):
+        self.ip = com_ip
+        self.port = com_port
         self.packets = []
+        self.name = file_name
+
 
 class Packet:
     def __init__(self, flag=b'0000', order=b'000000', crc=b'00000000', data=None):
@@ -40,7 +44,6 @@ def create_packet_flag(syn=False, size=False, name=False, psh=False, done=False,
     for parameter in parameters:
         if parameter:
             final_flag += bit_iterator
-            print(bit_iterator)
         bit_iterator *= 2
 
     return "{0:0{1}x}".format(final_flag, 4).encode()
@@ -91,25 +94,90 @@ def create_message_packets(fragments: list) -> list:
 
     return packets
 
-def assembler(given_data, given_addr):
-    global data
 
-    flags = decypher_packet_flag(data[:4])
-    if flags["SIZE"] == True and flags["TXT"] == True:
+def create_file_packets(fragments: list, filename: str) -> list:
+    packets = []
+    i = 1
+
+    header_flag = create_packet_flag(file=True, size=True, name=True, txt=True)
+    packets.append(Packet(flag=header_flag))
+
+    header_flag = create_packet_flag(psh=True, binary=True, file=True)
+    for fragment in fragments:
+        checksum = "{0:0{1}x}".format(crc_calculator.calculate_checksum(fragment), 8).encode()
+        new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
+        new_packet.order = "{0:0{1}x}".format(i, 6).encode()
+        i += 1
+        packets.append(new_packet)
+
+    packets[-1].flag = create_packet_flag(psh=True, binary=True, file=True, done=True)
+    packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
+    packets[0].data = filename.encode()
+
+    return packets
+
+def assemble_packets(com_to_assemble: Comm):
+    packets = com_to_assemble.packets
+    flags = decypher_packet_flag(packets[0][:4])
+    message = b''
+    if flags["MSG"]:
+        for packet in packets[1:]:
+            message += packet[18:]
+        console_lock.acquire()
+        print("(", com_to_assemble.ip,",", str(com_to_assemble.port), ")", message.decode("UTF-8"))
+        console_lock.release()
+    if flags["FILE"]:
+        f = open(com_to_assemble.name, "ab")
+        for packet in packets[1:]:
+            f.write(packet[18:])
+        f.close()
+        print("File transfer DONE!")
+
+
+
+
+def assembler(given_data, given_addr):
+    global packet_database
+
+    flags = decypher_packet_flag(given_data[:4])
+
+
+    if flags["SIZE"] and flags["MSG"]:
+        new_com = Comm(given_addr[0], given_addr[1])
+        new_com.packets.append(given_data)
+        packet_database.comms.append(new_com)
+    elif flags["MSG"]:
+        for com in packet_database.comms:
+            if com.ip == given_addr[0] and com.port == given_addr[1]:
+                com.packets.append(given_data)
+            if flags["DONE"]:
+                assemble_packets(com)
+                packet_database.comms.remove(com)
+            break
+    elif flags["FILE"] and flags["SIZE"]:
+        new_com = Comm(given_addr[0], given_addr[1], file_name=given_data[18:])
+        new_com.packets.append(given_data)
+        packet_database.comms.append(new_com)
+    elif flags["FILE"]:
+        for com in packet_database.comms:
+            if com.ip == given_addr[0] and com.port == given_addr[1]:
+                com.packets.append(given_data)
+            if flags["DONE"]:
+                assemble_packets(com)
+                packet_database.comms.remove(com)
+            break
+
 
 def recieve_mode():
     global ip, port, sock
     while True:
         data, addr = sock.recvfrom(1550)  # buffer size is 1024 bytes
-        ass = threading.Thread(target=assembler, args=(data, addr), daemon=True)
-
         console_lock.acquire()
-        print(addr, data)
+        #print(addr, data)
         console_lock.release()
 
-
-def send_file(args):
-    pass
+        ass = threading.Thread(target=assembler, args=(data, addr), daemon=True)
+        ass.start()
 
 
 def send_msg(args):
@@ -126,7 +194,26 @@ def send_msg(args):
 
 
 def send_file(args):
-    pass
+    arguments = args.split(" ", maxsplit=2)
+
+    root = tk.Tk()
+    root.withdraw()
+
+    file_path = filedialog.askopenfilename()
+
+    with open(file_path, "rb") as file:
+        byte = file.read()
+        file_fragments = fragment_message(byte)
+
+    print("File loaded succesfuly....")
+    filename = file_path.split("/")[-1]
+    print("Fragmenting file...")
+    file_frag = create_file_packets(file_fragments, filename)
+    print("Sending file...")
+    for frag in file_frag:
+        sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
+        time.sleep(0.0001)
+    print("FILE SENT SUCCESFULLY!")
 
 def listen():
     pass
@@ -163,7 +250,6 @@ def hub():
                     selected_size = int(input("Zadajte veľkosť fragmentu od 1B po 1472B: "))
                 fragment_size = selected_size
             print("FRAGMENT SIZE IS SET TO ", fragment_size)
-
 
         if command[0].lower() == "file" or command[0].lower() == "f":
             send_file(command[1])
