@@ -1,11 +1,15 @@
 import time
 import socket
 import threading
+import zlib
 import tkinter as tk
 from tkinter import filedialog
 from crc import CrcCalculator, Crc32
-crc_calculator = CrcCalculator(Crc32.CRC32)
+crc_calculator = CrcCalculator(Crc32.CRC32, True)
 console_lock = threading.Lock()
+ack_lock = threading.Lock()
+packet_change_event = threading.Event()
+last_packet = None
 
 
 class PacketDatabase:
@@ -48,11 +52,12 @@ def create_packet_flag(syn=False, size=False, name=False, psh=False, done=False,
 
     return "{0:0{1}x}".format(final_flag, 4).encode()
 
+
 def decypher_packet_flag(flag_bytes):
     bit_value_iter = 65536
 
-    flag_dict = {"NOD": False,"NNOD": False,"MSG": False,"FILE": False,"TXT": False,"BIN": False,"DONE": False,
-                "PSH": False,"NAME": False,"SIZE": False,"SYN": False
+    flag_dict = {"NOD": False, "NNOD": False, "MSG": False, "FILE": False, "TXT": False, "BIN": False, "DONE": False,
+                 "PSH": False, "NAME": False, "SIZE": False, "SYN": False
                  }
     dict_keys = ["NOD", "NNOD", "MSG", "FILE", "TXT", "BIN", "DONE", "PSH", "NAME", "SIZE", "SYN"]
     keys_iter = 10-16
@@ -83,7 +88,8 @@ def create_message_packets(fragments: list) -> list:
 
     header_flag = create_packet_flag(psh=True, txt=True, msg=True)
     for fragment in fragments:
-        checksum = "{0:0{1}x}".format(crc_calculator.calculate_checksum(fragment), 8).encode()
+        # checksum = "{0:0{1}x}".format(crc_calculator.calculate_checksum(fragment), 8).encode()
+        checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
         new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
         new_packet.order = "{0:0{1}x}".format(i, 6).encode()
         i += 1
@@ -104,7 +110,8 @@ def create_file_packets(fragments: list, filename: str) -> list:
 
     header_flag = create_packet_flag(psh=True, binary=True, file=True)
     for fragment in fragments:
-        checksum = "{0:0{1}x}".format(crc_calculator.calculate_checksum(fragment), 8).encode()
+        # checksum = "{0:0{1}x}".format(crc_calculator.calculate_checksum(fragment), 8).encode()
+        checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
         new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
         new_packet.order = "{0:0{1}x}".format(i, 6).encode()
         i += 1
@@ -116,6 +123,7 @@ def create_file_packets(fragments: list, filename: str) -> list:
 
     return packets
 
+
 def assemble_packets(com_to_assemble: Comm):
     packets = com_to_assemble.packets
     flags = decypher_packet_flag(packets[0][:4])
@@ -124,7 +132,7 @@ def assemble_packets(com_to_assemble: Comm):
         for packet in packets[1:]:
             message += packet[18:]
         console_lock.acquire()
-        print("(", com_to_assemble.ip,",", str(com_to_assemble.port), ")", message.decode("UTF-8"))
+        print("(", com_to_assemble.ip, ",", str(com_to_assemble.port), ")", message.decode("UTF-8"))
         console_lock.release()
     if flags["FILE"]:
         f = open(com_to_assemble.name, "ab")
@@ -134,15 +142,42 @@ def assemble_packets(com_to_assemble: Comm):
         print("File transfer DONE!")
 
 
-
-
 def assembler(given_data, given_addr):
-    global packet_database
+    global packet_database, sock, last_packet
+
 
     flags = decypher_packet_flag(given_data[:4])
+    last_packet = given_data
+    packet_change_event.set()
 
+
+
+    if flags["NOD"] or flags["NNOD"]:
+        print("ACK")
+
+
+
+    if flags["PSH"]:
+        local_crc = "{0:0{1}x}".format(zlib.crc32(given_data[18:]), 8).encode()
+        sender_crc = given_data[10:18]
+        print(sender_crc, local_crc)
+        if local_crc == sender_crc:
+            ack_packet = Packet(flag=create_packet_flag(nod=True))
+            time.sleep(0.001)
+            sock.sendto(ack_packet.raw(), given_addr)
+            print("NOD")
+        else:
+            nack_packet = Packet(flag=create_packet_flag(nnod=True))
+            sock.sendto(nack_packet.raw(), given_addr)
+            print("NNOD")
+            return
 
     if flags["SIZE"] and flags["MSG"]:
+        ack_packet = Packet(flag=create_packet_flag(nod=True))
+        time.sleep(0.001)
+        sock.sendto(ack_packet.raw(), given_addr)
+
+
         new_com = Comm(given_addr[0], given_addr[1])
         new_com.packets.append(given_data)
         packet_database.comms.append(new_com)
@@ -155,6 +190,10 @@ def assembler(given_data, given_addr):
                 packet_database.comms.remove(com)
             break
     elif flags["FILE"] and flags["SIZE"]:
+        ack_packet = Packet(flag=create_packet_flag(nod=True))
+        time.sleep(0.001)
+        sock.sendto(ack_packet.raw(), given_addr)
+
         new_com = Comm(given_addr[0], given_addr[1], file_name=given_data[18:])
         new_com.packets.append(given_data)
         packet_database.comms.append(new_com)
@@ -167,15 +206,10 @@ def assembler(given_data, given_addr):
                 packet_database.comms.remove(com)
             break
 
-
 def recieve_mode():
     global ip, port, sock
     while True:
         data, addr = sock.recvfrom(1550)  # buffer size is 1024 bytes
-        console_lock.acquire()
-        #print(addr, data)
-        console_lock.release()
-
         ass = threading.Thread(target=assembler, args=(data, addr), daemon=True)
         ass.start()
 
@@ -183,7 +217,7 @@ def recieve_mode():
 def send_msg(args):
     arguments = args.split(" ", maxsplit=2)
     console_lock.acquire()
-    print("SENDING MESSAGE TO" , arguments[0], " PORT:", arguments[1], " MESSAGE: ", arguments[2])
+    print("SENDING MESSAGE TO", arguments[0], " PORT:", arguments[1], " MESSAGE: ", arguments[2])
     console_lock.release()
     global sock
 
@@ -194,6 +228,7 @@ def send_msg(args):
 
 
 def send_file(args):
+    global last_packet
     arguments = args.split(" ", maxsplit=2)
 
     root = tk.Tk()
@@ -210,18 +245,27 @@ def send_file(args):
     print("Fragmenting file...")
     file_frag = create_file_packets(file_fragments, filename)
     print("Sending file...")
+
     for frag in file_frag:
         sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
-        time.sleep(0.0001)
-    print("FILE SENT SUCCESFULLY!")
+        packet_change_event.wait()
+        flags = decypher_packet_flag(last_packet[:4])
+        print(flags)
+        packet_change_event.set()
+        while flags["NNOD"]:
+            sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
+            ack_lock.acquire()
+            flags = decypher_packet_flag(last_packet[:4])
+            print(flags)
+            ack_lock.release()
+            time.sleep(0.001)
+            print("NNOD")
 
-def listen():
-    pass
+
+    print("FILE SENT SUCCESFULLY!")
 
 
 def hub():
-
-
     listener = threading.Thread(target=recieve_mode, args=(), daemon=True)
     listener.stopped = False
     listener.start()
@@ -232,9 +276,9 @@ def hub():
         command = input("INPUT COMMANDS:\n").split(" ", maxsplit=1)
 
         if command[0].lower() == "socket" or command[0].lower() == "s":
-            socket = command[1].split(" ")
-            ip = socket[0]
-            port = socket[1]
+            new_socket = command[1].split(" ")
+            ip = new_socket[0]
+            port = new_socket[1]
             print("SOCKET HAS CHANGED TO", ip, "PORT", port)
 
         if command[0].lower() == "fragment" or command[0].lower() == "fr":
@@ -264,7 +308,6 @@ if __name__ == '__main__':
     ip = "127.0.0.1"
     port = input("SET PORT: ")
 
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((ip, int(port)))
@@ -272,5 +315,3 @@ if __name__ == '__main__':
 
     hub()
     # alicemessage = "Chapter One – Down the Rabbit Hole: Alice, a seven-year-old girl, is feeling bored and drowsy while sitting on the riverbank with her elder sister. She notices a talking, clothed white rabbit with a pocket watch run past. She follows it down a rabbit hole where she suddenly falls a long way to a curious hall with many locked doors of all sizes. She finds a little key to a door too small for her to fit through, but through it, she sees an attractive garden. She then discovers a bottle on a table labelled DRINK ME, the contents of which cause her to shrink too small to reach the key which she had left on the table. She subsequently eats a cake labelled  in currants as the chapter closes.Chapter Two – The Pool of Tears: The chapter opens with Alice growing to such a tremendous size that her head hits the ceiling. Unhappy, Alice begins to cry and her tears literally flood the hallway. After she picks up a fan that causes her to shrink back down, Alice swims through her own tears and meets a mouse, who is swimming as well. Alice, thinking he may be a French mouse, tries to make small talk with him in elementary French. Her opening gambit Où est ma chatte? (transl.Where is my cat?), however, offends the mouse, who then tries to escape her.Chapter Three – The Caucus Race and a Long Tale: The sea of tears becomes crowded with other animals and birds that have been swept away by the rising waters. Alice and the other animals convene on the bank and the question among them is how to get dry again. Mouse gives them a very dry lecture on William the Conqueror. A dodo decides that the best thing to dry them off would be a Caucus-Race, which consists of everyone running in a circle with no clear winner. Alice eventually frightens all the animals away, unwittingly, by talking about her (moderately ferocious) cat.Chapter Four – The Rabbit Sends a Little Bill: White Rabbit appears again in search of the Duchess's gloves and fan. Mistaking her for his maidservant, Mary Ann, Rabbit orders Alice to go into the house and retrieve them. Inside the house she finds another little bottle and drinks from it, immediately beginning to grow again. The horrified Rabbit orders his gardener, Bill the Lizard, to climb on the roof and go down the chimney. Outside, Alice hears the voices of animals that have gathered to gawk at her giant arm. The crowd hurls pebbles at her, which turn into little cakes. Alice eats them, and they reduce her again in size.Chapter Five – Advice from a Caterpillar: Alice comes upon a mushroom and sitting on it is a blue caterpillar smoking a hookah. Caterpillar questions Alice, who begins to admit to her current identity crisis, compounded by her inability to remember a poem. Before crawling away, the caterpillar tells Alice that one side of the mushroom will make her taller and the other side will make her shorter. She breaks off two pieces from the mushroom. One side makes her shrink smaller than ever, while another causes her neck to grow high into the trees, where a pigeon mistakes her for a serpent. With some effort, Alice brings herself back to her normal height. She stumbles upon a small estate and uses the mushroom to reach a more appropriate height. "
-
-
