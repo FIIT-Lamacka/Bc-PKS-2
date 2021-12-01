@@ -1,15 +1,20 @@
 import time
 import socket
 import threading
+import random
+from colorama import *
 import zlib
 import tkinter as tk
 from tkinter import filedialog
 from crc import CrcCalculator, Crc32
+
 crc_calculator = CrcCalculator(Crc32.CRC32, True)
 console_lock = threading.Lock()
 ack_lock = threading.Lock()
 packet_change_event = threading.Event()
 last_packet = None
+make_errors = False
+init()
 
 
 class PacketDatabase:
@@ -33,10 +38,31 @@ class Packet:
         self.data = data
 
     def raw(self):
+        global make_errors
+        error_if_zero = random.randint(0, 16)
         string = self.flag + self.order + self.crc
-        if self.data is not None:
+
+        if self.data is not None and not make_errors:
             string += self.data
+        elif self.data is not None and make_errors and error_if_zero == 0:
+            bad_data = self.data
+            error_at = random.randint(0, len(bad_data)-1)
+            string += bad_data[:error_at] + b'0' + bad_data[error_at:]
+        elif self.data is not None and make_errors:
+            string += self.data
+
         return string
+
+# ZDROJ: Greenstick - https://stackoverflow.com/questions/3173320/text-progress-bar-in-the-console
+def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█', printEnd = "\r"):
+
+    percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
+    filledLength = int(length * iteration // total)
+    bar = fill * filledLength + '-' * (length - filledLength)
+    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end = printEnd)
+    # Print New Line on Complete
+    if iteration == total:
+        print()
 
 
 def create_packet_flag(syn=False, size=False, name=False, psh=False, done=False, binary=False, txt=False,
@@ -54,8 +80,8 @@ def create_packet_flag(syn=False, size=False, name=False, psh=False, done=False,
 
 
 def decypher_packet_flag(flag_bytes):
-    bit_value_iter = 65536
 
+    bit_value_iter = 65536
     flag_dict = {"NOD": False, "NNOD": False, "MSG": False, "FILE": False, "TXT": False, "BIN": False, "DONE": False,
                  "PSH": False, "NAME": False, "SIZE": False, "SYN": False
                  }
@@ -75,11 +101,13 @@ def decypher_packet_flag(flag_bytes):
 
 
 def fragment_message(message: bytes) -> list:
+
     global fragment_size
     return [message[i:i + fragment_size] for i in range(0, len(message), fragment_size)]
 
 
 def create_message_packets(fragments: list) -> list:
+
     packets = []
     i = 1
 
@@ -102,6 +130,7 @@ def create_message_packets(fragments: list) -> list:
 
 
 def create_file_packets(fragments: list, filename: str) -> list:
+
     packets = []
     i = 1
 
@@ -125,6 +154,7 @@ def create_file_packets(fragments: list, filename: str) -> list:
 
 
 def assemble_packets(com_to_assemble: Comm):
+
     packets = com_to_assemble.packets
     flags = decypher_packet_flag(packets[0][:4])
     message = b''
@@ -143,33 +173,31 @@ def assemble_packets(com_to_assemble: Comm):
 
 
 def assembler(given_data, given_addr):
-    global packet_database, sock, last_packet
 
+    global packet_database, sock, last_packet
 
     flags = decypher_packet_flag(given_data[:4])
     last_packet = given_data
     packet_change_event.set()
 
-
-
-    if flags["NOD"] or flags["NNOD"]:
+    """if flags["NOD"]:
         print("ACK")
 
-
+    if flags["NNOD"]:
+        print("NACK")"""
 
     if flags["PSH"]:
         local_crc = "{0:0{1}x}".format(zlib.crc32(given_data[18:]), 8).encode()
         sender_crc = given_data[10:18]
-        print(sender_crc, local_crc)
         if local_crc == sender_crc:
             ack_packet = Packet(flag=create_packet_flag(nod=True))
             time.sleep(0.001)
             sock.sendto(ack_packet.raw(), given_addr)
-            print("NOD")
+
         else:
             nack_packet = Packet(flag=create_packet_flag(nnod=True))
             sock.sendto(nack_packet.raw(), given_addr)
-            print("NNOD")
+            print("CRC Error! Sending packet resend request.")
             return
 
     if flags["SIZE"] and flags["MSG"]:
@@ -206,7 +234,9 @@ def assembler(given_data, given_addr):
                 packet_database.comms.remove(com)
             break
 
+
 def recieve_mode():
+
     global ip, port, sock
     while True:
         data, addr = sock.recvfrom(1550)  # buffer size is 1024 bytes
@@ -215,6 +245,7 @@ def recieve_mode():
 
 
 def send_msg(args):
+
     arguments = args.split(" ", maxsplit=2)
     console_lock.acquire()
     print("SENDING MESSAGE TO", arguments[0], " PORT:", arguments[1], " MESSAGE: ", arguments[2])
@@ -223,11 +254,15 @@ def send_msg(args):
 
     msg_frag = fragment_message(arguments[2].encode())
     msg_frag = create_message_packets(msg_frag)
+
+
+
     for frag in msg_frag:
         sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
 
 
 def send_file(args):
+
     global last_packet
     arguments = args.split(" ", maxsplit=2)
 
@@ -240,32 +275,42 @@ def send_file(args):
         byte = file.read()
         file_fragments = fragment_message(byte)
 
-    print("File loaded succesfuly....")
+    print(Fore.GREEN + "File loaded succesfuly...." + Style.RESET_ALL)
     filename = file_path.split("/")[-1]
     print("Fragmenting file...")
     file_frag = create_file_packets(file_fragments, filename)
-    print("Sending file...")
+    print("Sending file...\n")
+
+    packet_no = 0
+    total_packets_len = len(file_frag)
 
     for frag in file_frag:
+        packet_no += 1
         sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
         packet_change_event.wait()
         flags = decypher_packet_flag(last_packet[:4])
-        print(flags)
-        packet_change_event.set()
+        # print(".")
+        packet_change_event.clear()
+        nnod_counter = 0
         while flags["NNOD"]:
+            if nnod_counter == 3:
+                print(Fore.RED + "FILE NOT SENT!" + Style.RESET_ALL)
+                return
+
+            nnod_counter += 1
             sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
-            ack_lock.acquire()
+            packet_change_event.wait()
             flags = decypher_packet_flag(last_packet[:4])
-            print(flags)
-            ack_lock.release()
-            time.sleep(0.001)
-            print("NNOD")
+            # print(".")
+            packet_change_event.clear()
 
-
-    print("FILE SENT SUCCESFULLY!")
+            # time.sleep(0.001)
+        printProgressBar(packet_no, total_packets_len)
+    print(Fore.GREEN + "\nFILE SENT SUCCESFULLY!" + Style.RESET_ALL)
 
 
 def hub():
+
     listener = threading.Thread(target=recieve_mode, args=(), daemon=True)
     listener.stopped = False
     listener.start()
@@ -273,7 +318,8 @@ def hub():
 
     while True:
         global ip, port, mode
-        command = input("INPUT COMMANDS:\n").split(" ", maxsplit=1)
+        print(Fore.CYAN + "INPUT COMMANDS:\n" + Style.RESET_ALL)
+        command = input("").split(" ", maxsplit=1)
 
         if command[0].lower() == "socket" or command[0].lower() == "s":
             new_socket = command[1].split(" ")
@@ -303,10 +349,13 @@ def hub():
 
 
 if __name__ == '__main__':
+
     mode = "receive"
     fragment_size = 1472
     ip = "127.0.0.1"
-    port = input("SET PORT: ")
+
+    print(Fore.CYAN + "SET PORT: " + Style.RESET_ALL, end="")
+    port = input("")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
