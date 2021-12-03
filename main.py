@@ -10,16 +10,39 @@ from crc import CrcCalculator, Crc32
 
 crc_calculator = CrcCalculator(Crc32.CRC32, True)
 console_lock = threading.Lock()
+socket_lock = threading.Lock()
 ack_lock = threading.Lock()
 packet_change_event = threading.Event()
+connections = []
 last_packet = None
+last_socket = ("0", 0)
 make_errors = False
 init()
+
+"""
+TODO:
+
+-ACK timeout
+-Nastavenie na chybovosť
+-socket change
+-farbičky
+-vypísanie počtu posielaných packetov a veľkosť
+-vypísať umiestnenie súborov a kam ukladať
+-udržiavanie spojenia
+
+"""
 
 
 class PacketDatabase:
     def __init__(self):
         self.comms = []
+
+
+class Connection:
+    def __init__(self):
+        self.ip = None
+        self.port = None
+        self.last_hello_time = None
 
 
 class Comm:
@@ -31,7 +54,7 @@ class Comm:
 
 
 class Packet:
-    def __init__(self, flag=b'0000', order=b'000000', crc=b'00000000', data=None):
+    def __init__(self, flag=b'\x00\x00', order=b'\x00\x00\x00', crc=b'\x00\x00\x00\x00', data=None):
         self.flag = flag
         self.order = order
         self.crc = crc
@@ -53,13 +76,14 @@ class Packet:
 
         return string
 
+
 # ZDROJ: Greenstick - https://stackoverflow.com/questions/3173320/text-progress-bar-in-the-console
-def printProgressBar (iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█', printEnd = "\r"):
+def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=100, fill='█', print_end="\r"):
 
     percent = ("{0:." + str(decimals) + "f}").format(100 * (iteration / float(total)))
-    filledLength = int(length * iteration // total)
-    bar = fill * filledLength + '-' * (length - filledLength)
-    print(f'\r{prefix} |{bar}| {percent}% {suffix}', end = printEnd)
+    filled_length = int(length * iteration // total)
+    bar = fill * filled_length + '░' * (length - filled_length)
+    print(f'\r\t{prefix}|{bar}| {percent}% {suffix}', end=print_end)
     # Print New Line on Complete
     if iteration == total:
         print()
@@ -76,8 +100,8 @@ def create_packet_flag(syn=False, size=False, name=False, psh=False, done=False,
             final_flag += bit_iterator
         bit_iterator *= 2
 
-    return "{0:0{1}x}".format(final_flag, 4).encode()
-
+    # return "{0:0{1}x}".format(final_flag, 4).encode()
+    return final_flag.to_bytes(3, byteorder="big")
 
 def decypher_packet_flag(flag_bytes):
 
@@ -88,7 +112,9 @@ def decypher_packet_flag(flag_bytes):
     dict_keys = ["NOD", "NNOD", "MSG", "FILE", "TXT", "BIN", "DONE", "PSH", "NAME", "SIZE", "SYN"]
     keys_iter = 10-16
 
-    flag = int(flag_bytes, 16)
+
+    # flag = int(flag_bytes, 16)
+    flag = int.from_bytes(flag_bytes, byteorder="big")
 
     for i in range(17):
         if flag - bit_value_iter >= 0:
@@ -116,10 +142,10 @@ def create_message_packets(fragments: list) -> list:
 
     header_flag = create_packet_flag(psh=True, txt=True, msg=True)
     for fragment in fragments:
-        # checksum = "{0:0{1}x}".format(crc_calculator.calculate_checksum(fragment), 8).encode()
         checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
         new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
-        new_packet.order = "{0:0{1}x}".format(i, 6).encode()
+        # new_packet.order = "{0:0{1}x}".format(i, 6).encode()
+        new_packet.order = i.to_bytes(3, byteorder="big")
         i += 1
         packets.append(new_packet)
 
@@ -139,15 +165,16 @@ def create_file_packets(fragments: list, filename: str) -> list:
 
     header_flag = create_packet_flag(psh=True, binary=True, file=True)
     for fragment in fragments:
-        # checksum = "{0:0{1}x}".format(crc_calculator.calculate_checksum(fragment), 8).encode()
         checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
         new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
-        new_packet.order = "{0:0{1}x}".format(i, 6).encode()
+        # new_packet.order = "{0:0{1}x}".format(i, 6).encode()
+        new_packet.order = i.to_bytes(3, byteorder="big")
         i += 1
         packets.append(new_packet)
 
     packets[-1].flag = create_packet_flag(psh=True, binary=True, file=True, done=True)
     packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
+    packets[0].order = len(packets).to_bytes(3, byteorder="big")
     packets[0].data = filename.encode()
 
     return packets
@@ -174,10 +201,11 @@ def assemble_packets(com_to_assemble: Comm):
 
 def assembler(given_data, given_addr):
 
-    global packet_database, sock, last_packet
+    global packet_database, sock, last_packet, last_socket
 
     flags = decypher_packet_flag(given_data[:4])
     last_packet = given_data
+    last_socket = given_addr
     packet_change_event.set()
 
     """if flags["NOD"]:
@@ -186,25 +214,28 @@ def assembler(given_data, given_addr):
     if flags["NNOD"]:
         print("NACK")"""
 
+    if flags["SYN"] and flags["NOD"]:
+        syn_packet = Packet(flag=create_packet_flag(syn=True))
+        sock.sendto(syn_packet.raw(), given_addr)
+        return
+
     if flags["PSH"]:
         local_crc = "{0:0{1}x}".format(zlib.crc32(given_data[18:]), 8).encode()
         sender_crc = given_data[10:18]
         if local_crc == sender_crc:
             ack_packet = Packet(flag=create_packet_flag(nod=True))
-            time.sleep(0.001)
             sock.sendto(ack_packet.raw(), given_addr)
 
         else:
             nack_packet = Packet(flag=create_packet_flag(nnod=True))
             sock.sendto(nack_packet.raw(), given_addr)
+
             print("CRC Error! Sending packet resend request.")
             return
 
     if flags["SIZE"] and flags["MSG"]:
         ack_packet = Packet(flag=create_packet_flag(nod=True))
-        time.sleep(0.001)
         sock.sendto(ack_packet.raw(), given_addr)
-
 
         new_com = Comm(given_addr[0], given_addr[1])
         new_com.packets.append(given_data)
@@ -219,7 +250,6 @@ def assembler(given_data, given_addr):
             break
     elif flags["FILE"] and flags["SIZE"]:
         ack_packet = Packet(flag=create_packet_flag(nod=True))
-        time.sleep(0.001)
         sock.sendto(ack_packet.raw(), given_addr)
 
         new_com = Comm(given_addr[0], given_addr[1], file_name=given_data[18:])
@@ -244,21 +274,63 @@ def recieve_mode():
         ass.start()
 
 
+def create_connection(dest_ip, dest_port):
+
+    for con in connections:
+        if con.ip == dest_ip and con.port == dest_port:
+            print("Connection already established")
+            return
+
+    packet_flag = create_packet_flag(syn=True, nod=True)
+    syn_packet = Packet(flag=packet_flag)
+
+    sock.sendto(syn_packet.raw(), (dest_ip, dest_port))
+    flags = decypher_packet_flag(create_packet_flag())
+    while not flags["SYN"] and last_socket[0] == dest_ip and int(last_socket[1]) == dest_port:
+        packet_change_event.wait()
+        flags = decypher_packet_flag(last_packet[:4])
+        packet_change_event.clear()
+
+    new_connection = Connection()
+    new_connection.ip = dest_ip
+    new_connection.port = dest_port
+    new_connection.last_hello_time = time.time_ns()
+    print("Created new connection!")
+    connections.append(new_connection)
+
+
 def send_msg(args):
-
+    global last_packet, sock
     arguments = args.split(" ", maxsplit=2)
-    console_lock.acquire()
     print("SENDING MESSAGE TO", arguments[0], " PORT:", arguments[1], " MESSAGE: ", arguments[2])
-    console_lock.release()
-    global sock
 
+    print("Fragmenting message...")
     msg_frag = fragment_message(arguments[2].encode())
     msg_frag = create_message_packets(msg_frag)
+    packet_no = 0
+    total_packets_len = len(msg_frag)
 
-
-
+    print("Sending message...")
     for frag in msg_frag:
+        packet_no += 1
         sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
+        packet_change_event.wait()
+        flags = decypher_packet_flag(last_packet[:4])
+        packet_change_event.clear()
+        nnod_counter = 0
+        while flags["NNOD"]:
+            if nnod_counter == 3:
+                print(Fore.RED + "MESSAGE NOT SENT!" + Style.RESET_ALL)
+                return
+
+            nnod_counter += 1
+            sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
+            packet_change_event.wait()
+            flags = decypher_packet_flag(last_packet[:4])
+            packet_change_event.clear()
+
+        print_progress_bar(packet_no, total_packets_len)
+    print(Fore.GREEN + "\nMESSAGE SENT SUCCESFULLY!" + Style.RESET_ALL)
 
 
 def send_file(args):
@@ -274,16 +346,18 @@ def send_file(args):
     with open(file_path, "rb") as file:
         byte = file.read()
         file_fragments = fragment_message(byte)
-
-    print(Fore.GREEN + "File loaded succesfuly...." + Style.RESET_ALL)
+    print(Fore.GREEN + "\tFile loaded succesfuly...." + Style.RESET_ALL)
     filename = file_path.split("/")[-1]
-    print("Fragmenting file...")
-    file_frag = create_file_packets(file_fragments, filename)
-    print("Sending file...\n")
 
+    print("\tFragmenting file...")
+    file_frag = create_file_packets(file_fragments, filename)
     packet_no = 0
     total_packets_len = len(file_frag)
 
+    print("\tEstablishing connection: ", end="")
+    create_connection(arguments[0], int(arguments[1]))
+
+    print("\tSending file...\n")
     for frag in file_frag:
         packet_no += 1
         sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
@@ -294,19 +368,17 @@ def send_file(args):
         nnod_counter = 0
         while flags["NNOD"]:
             if nnod_counter == 3:
-                print(Fore.RED + "FILE NOT SENT!" + Style.RESET_ALL)
+                print(Fore.RED + "\tFILE NOT SENT!" + Style.RESET_ALL)
                 return
 
             nnod_counter += 1
             sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
             packet_change_event.wait()
             flags = decypher_packet_flag(last_packet[:4])
-            # print(".")
             packet_change_event.clear()
 
-            # time.sleep(0.001)
-        printProgressBar(packet_no, total_packets_len)
-    print(Fore.GREEN + "\nFILE SENT SUCCESFULLY!" + Style.RESET_ALL)
+        print_progress_bar(packet_no, total_packets_len)
+    print(Fore.GREEN + "\n\tFILE SENT SUCCESFULLY!" + Style.RESET_ALL)
 
 
 def hub():
