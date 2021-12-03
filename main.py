@@ -42,7 +42,7 @@ class Connection:
     def __init__(self):
         self.ip = None
         self.port = None
-        self.last_hello_time = None
+        self.last_hello_time = 0
 
 
 class Comm:
@@ -101,7 +101,8 @@ def create_packet_flag(syn=False, size=False, name=False, psh=False, done=False,
         bit_iterator *= 2
 
     # return "{0:0{1}x}".format(final_flag, 4).encode()
-    return final_flag.to_bytes(3, byteorder="big")
+    return final_flag.to_bytes(2, byteorder="big")
+
 
 def decypher_packet_flag(flag_bytes):
 
@@ -142,7 +143,8 @@ def create_message_packets(fragments: list) -> list:
 
     header_flag = create_packet_flag(psh=True, txt=True, msg=True)
     for fragment in fragments:
-        checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
+        # checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
+        checksum = zlib.crc32(fragment).to_bytes(4, byteorder="big")
         new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
         # new_packet.order = "{0:0{1}x}".format(i, 6).encode()
         new_packet.order = i.to_bytes(3, byteorder="big")
@@ -150,7 +152,8 @@ def create_message_packets(fragments: list) -> list:
         packets.append(new_packet)
 
     packets[-1].flag = create_packet_flag(psh=True, txt=True, msg=True, done=True)
-    packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
+    #packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
+    packets[0].order = len(packets).to_bytes(3, byteorder="big")
 
     return packets
 
@@ -165,7 +168,8 @@ def create_file_packets(fragments: list, filename: str) -> list:
 
     header_flag = create_packet_flag(psh=True, binary=True, file=True)
     for fragment in fragments:
-        checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
+        # checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
+        checksum = zlib.crc32(fragment).to_bytes(4, byteorder="big")
         new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
         # new_packet.order = "{0:0{1}x}".format(i, 6).encode()
         new_packet.order = i.to_bytes(3, byteorder="big")
@@ -173,7 +177,7 @@ def create_file_packets(fragments: list, filename: str) -> list:
         packets.append(new_packet)
 
     packets[-1].flag = create_packet_flag(psh=True, binary=True, file=True, done=True)
-    packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
+    #packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
     packets[0].order = len(packets).to_bytes(3, byteorder="big")
     packets[0].data = filename.encode()
 
@@ -183,45 +187,54 @@ def create_file_packets(fragments: list, filename: str) -> list:
 def assemble_packets(com_to_assemble: Comm):
 
     packets = com_to_assemble.packets
-    flags = decypher_packet_flag(packets[0][:4])
+    flags = decypher_packet_flag(packets[0][:2])
     message = b''
     if flags["MSG"]:
         for packet in packets[1:]:
-            message += packet[18:]
+            message += packet[9:]
         console_lock.acquire()
         print("(", com_to_assemble.ip, ",", str(com_to_assemble.port), ")", message.decode("UTF-8"))
         console_lock.release()
     if flags["FILE"]:
         f = open(com_to_assemble.name, "ab")
         for packet in packets[1:]:
-            f.write(packet[18:])
+            f.write(packet[9:])
         f.close()
-        print("File transfer DONE!")
+        print(Fore.GREEN + "File transfer DONE!" + Style.RESET_ALL)
 
 
 def assembler(given_data, given_addr):
 
     global packet_database, sock, last_packet, last_socket
 
-    flags = decypher_packet_flag(given_data[:4])
+    flags = decypher_packet_flag(given_data[:2])
     last_packet = given_data
     last_socket = given_addr
     packet_change_event.set()
 
-    """if flags["NOD"]:
-        print("ACK")
-
-    if flags["NNOD"]:
-        print("NACK")"""
 
     if flags["SYN"] and flags["NOD"]:
+        global connections
         syn_packet = Packet(flag=create_packet_flag(syn=True))
         sock.sendto(syn_packet.raw(), given_addr)
+
+        new_con = Connection()
+        new_con.ip = given_addr[0]
+        new_con.port = given_addr[1]
+        connections.append(new_con)
+        return
+
+    if flags["SYN"] and flags["NNOD"]:
+        print("Recieved HELLO from", given_addr[0], given_addr[1])
+        update = threading.Thread(target=connection_update, args=(given_addr[0], given_addr[1]), daemon=True)
+        update.start()
+
         return
 
     if flags["PSH"]:
-        local_crc = "{0:0{1}x}".format(zlib.crc32(given_data[18:]), 8).encode()
-        sender_crc = given_data[10:18]
+        #local_crc = "{0:0{1}x}".format(zlib.crc32(given_data[9:]), 8).encode()
+        local_crc = zlib.crc32(given_data[9:]).to_bytes(4, byteorder="big")
+        sender_crc = given_data[5:9]
         if local_crc == sender_crc:
             ack_packet = Packet(flag=create_packet_flag(nod=True))
             sock.sendto(ack_packet.raw(), given_addr)
@@ -230,7 +243,7 @@ def assembler(given_data, given_addr):
             nack_packet = Packet(flag=create_packet_flag(nnod=True))
             sock.sendto(nack_packet.raw(), given_addr)
 
-            print("CRC Error! Sending packet resend request.")
+            print(Fore.RED + "CRC Error! Sending packet resend request." + Style.RESET_ALL)
             return
 
     if flags["SIZE"] and flags["MSG"]:
@@ -252,7 +265,7 @@ def assembler(given_data, given_addr):
         ack_packet = Packet(flag=create_packet_flag(nod=True))
         sock.sendto(ack_packet.raw(), given_addr)
 
-        new_com = Comm(given_addr[0], given_addr[1], file_name=given_data[18:])
+        new_com = Comm(given_addr[0], given_addr[1], file_name=given_data[9:])
         new_com.packets.append(given_data)
         packet_database.comms.append(new_com)
     elif flags["FILE"]:
@@ -269,7 +282,11 @@ def recieve_mode():
 
     global ip, port, sock
     while True:
-        data, addr = sock.recvfrom(1550)  # buffer size is 1024 bytes
+        try:
+            data, addr = sock.recvfrom(1550)  # buffer size is 1024 bytes
+        except ConnectionResetError:
+            pass
+
         ass = threading.Thread(target=assembler, args=(data, addr), daemon=True)
         ass.start()
 
@@ -288,15 +305,49 @@ def create_connection(dest_ip, dest_port):
     flags = decypher_packet_flag(create_packet_flag())
     while not flags["SYN"] and last_socket[0] == dest_ip and int(last_socket[1]) == dest_port:
         packet_change_event.wait()
-        flags = decypher_packet_flag(last_packet[:4])
+        flags = decypher_packet_flag(last_packet[:2])
         packet_change_event.clear()
 
     new_connection = Connection()
     new_connection.ip = dest_ip
     new_connection.port = dest_port
-    new_connection.last_hello_time = time.time_ns()
+    new_connection.last_hello_time = 0
     print("Created new connection!")
     connections.append(new_connection)
+
+
+def connection_hello():
+    global connections
+
+    while True:
+        time.sleep(5)
+        for conn in connections:
+            hello_packet = Packet(flag=create_packet_flag(syn=True, nnod=True))
+            sock.sendto(hello_packet.raw(), (conn.ip, conn.port))
+            print("Sending hello to:", conn.ip,  conn.port)
+
+
+def connection_update(ip, port):
+    global connections
+    for con in connections:
+        if con.ip == ip and con.port == port:
+            con.last_hello_time = 0
+
+
+def connection_killer():
+    global connections
+
+    while True:
+        to_delete = []
+        time.sleep(1)
+        for conn in connections:
+            conn.last_hello_time += 1
+            if conn.last_hello_time >= 10:
+                print(Fore.YELLOW + "No HELLO response from", conn.ip, conn.port, "terminating!" + Style.RESET_ALL)
+                to_delete.append(conn)
+
+        for dead_connection in to_delete:
+            connections.remove(dead_connection)
 
 
 def send_msg(args):
@@ -315,7 +366,7 @@ def send_msg(args):
         packet_no += 1
         sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
         packet_change_event.wait()
-        flags = decypher_packet_flag(last_packet[:4])
+        flags = decypher_packet_flag(last_packet[:2])
         packet_change_event.clear()
         nnod_counter = 0
         while flags["NNOD"]:
@@ -326,7 +377,7 @@ def send_msg(args):
             nnod_counter += 1
             sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
             packet_change_event.wait()
-            flags = decypher_packet_flag(last_packet[:4])
+            flags = decypher_packet_flag(last_packet[:2])
             packet_change_event.clear()
 
         print_progress_bar(packet_no, total_packets_len)
@@ -362,7 +413,7 @@ def send_file(args):
         packet_no += 1
         sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
         packet_change_event.wait()
-        flags = decypher_packet_flag(last_packet[:4])
+        flags = decypher_packet_flag(last_packet[:2])
         # print(".")
         packet_change_event.clear()
         nnod_counter = 0
@@ -374,7 +425,7 @@ def send_file(args):
             nnod_counter += 1
             sock.sendto(frag.raw(), (arguments[0], int(arguments[1])))
             packet_change_event.wait()
-            flags = decypher_packet_flag(last_packet[:4])
+            flags = decypher_packet_flag(last_packet[:2])
             packet_change_event.clear()
 
         print_progress_bar(packet_no, total_packets_len)
@@ -386,6 +437,10 @@ def hub():
     listener = threading.Thread(target=recieve_mode, args=(), daemon=True)
     listener.stopped = False
     listener.start()
+    hello = threading.Thread(target=connection_hello, args=(), daemon=True)
+    hello.start()
+    hello_killer = threading.Thread(target=connection_killer, args=(), daemon=True)
+    hello_killer.start()
     time.sleep(0.2)
 
     while True:
