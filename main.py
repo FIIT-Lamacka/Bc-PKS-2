@@ -13,6 +13,7 @@ console_lock = threading.Lock()
 socket_lock = threading.Lock()
 hello_lock = threading.Lock()
 ack_lock = threading.Lock()
+delete_lock = threading.Lock()
 
 send_event = threading.Event()
 packet_change_event = threading.Event()
@@ -23,6 +24,8 @@ last_socket = ("0", 0)
 last_flags = {"NOD": False, "NNOD": False, "MSG": False, "FILE": False, "TXT": False, "BIN": False, "DONE": False,
               "PSH": False, "NAME": False, "SIZE": False, "SYN": False}
 make_errors = False
+
+to_delete_workaround = []
 
 save_location = ""
 init()
@@ -38,6 +41,7 @@ class Connection:
         self.ip = None
         self.port = None
         self.last_hello_time = 0
+        self.removed = False
 
 
 class Comm:
@@ -195,7 +199,10 @@ def assemble_packets(com_to_assemble: Comm):
         for packet in assembled_packets[1:]:
             f.write(packet[9:])
         f.close()
-        locked_print(Fore.GREEN + "File transfer done! \n File saved to" + save_location + Style.RESET_ALL)
+        if save_location == "":
+            locked_print(Fore.GREEN + "File transfer done! \n File saved to script directory" + Style.RESET_ALL)
+        else:
+            locked_print(Fore.GREEN + "File transfer done! \n File saved to" + save_location + Style.RESET_ALL)
 
 
 def assembler(given_data, given_addr):
@@ -209,13 +216,18 @@ def assembler(given_data, given_addr):
 
     if flags["SYN"] and flags["NOD"]:
         global connections
+        locked_print("Recieved SYN and NOD packet")
         syn_packet = Packet(flag=create_packet_flag(syn=True))
         sock.sendto(syn_packet.raw(), given_addr)
 
         new_con = Connection()
         new_con.ip = given_addr[0]
         new_con.port = given_addr[1]
+
+        
         connections.append(new_con)
+        
+
         packet_change_event.set()
         return
 
@@ -224,6 +236,15 @@ def assembler(given_data, given_addr):
 
         update = threading.Thread(target=connection_update, args=(given_addr[0], given_addr[1]), daemon=True)
         update.start()
+        packet_change_event.set()
+        return
+
+    if flags["SYN"] and flags["DONE"] and not flags["NOD"]:
+        locked_print("Recieved END CONNECTION from", given_addr[0], given_addr[1])
+        end_packet = Packet(flag=create_packet_flag(syn=True, done=True, nod=True))
+        sock.sendto(end_packet.raw(), given_addr)
+        end_connection(given_addr[0] + " " + str(given_addr[1]))
+
         packet_change_event.set()
         return
 
@@ -303,10 +324,12 @@ def recieve_mode():
 
 def create_connection(dest_ip, dest_port):
 
+    
     for con in connections:
         if con.ip == dest_ip and con.port == dest_port:
             locked_print("Connection already established")
             return
+    
 
     packet_flag = create_packet_flag(syn=True, nod=True)
     syn_packet = Packet(flag=packet_flag)
@@ -327,7 +350,9 @@ def create_connection(dest_ip, dest_port):
     new_connection.port = dest_port
     new_connection.last_hello_time = 0
     locked_print("Created new connection!")
+    
     connections.append(new_connection)
+    
 
 
 def connection_hello():
@@ -336,50 +361,89 @@ def connection_hello():
     while True:
         time.sleep(5)
         send_event.wait()
+        
         for conn in connections:
-            hello_packet = Packet(flag=create_packet_flag(syn=True, nnod=True))
-            sock.sendto(hello_packet.raw(), (conn.ip, conn.port))
+            if not conn.removed:
+                hello_packet = Packet(flag=create_packet_flag(syn=True, nnod=True))
+                sock.sendto(hello_packet.raw(), (conn.ip, conn.port))
 
             locked_print("Sending hello to:", conn.ip,  conn.port)
+        
 
 
 def connection_update(given_ip, given_port):
 
     global connections
+
+    
     for con in connections:
         if con.ip == given_ip and con.port == given_port:
             con.last_hello_time = 0
+    
 
 
 def connection_killer():
-    global connections
+    global connections, to_delete_workaround
 
     while True:
         to_delete = []
         send_event.wait()
         time.sleep(1)
+
+        
         for conn in connections:
             conn.last_hello_time += 1
-            if conn.last_hello_time >= 10:
+
+            if conn.removed:
+                to_delete.append(conn)
+            elif conn.last_hello_time >= 15:
                 locked_print(Fore.YELLOW + "No HELLO response from", conn.ip, conn.port, "terminating!"
                              + Style.RESET_ALL)
                 to_delete.append(conn)
 
         for dead_connection in to_delete:
             connections.remove(dead_connection)
+        
 
 
 def end_connection(connection):
 
-    global connections
+    global connections, to_delete_workaround
     given_socket = connection.split(" ")
 
+    
     for con in connections:
         if con.ip == given_socket[0] and con.port == int(given_socket[1]):
-            locked_print("Removing " + connection + "connection!")
+            locked_print("Removing " + con.ip + " " + str(con.port) + " connection!")
+            con.removed = True
             connections.remove(con)
+            
             return
     locked_print("Connection not found!")
+    
+
+
+def connection_signal_end(argument):
+    global sock, last_flags
+
+    send_event.clear()
+    time.sleep(0.5)
+    to_end = argument.split(" ")
+
+    packet_change_event.clear()
+
+    end_packet = Packet(flag=create_packet_flag(syn=True, done=True))
+    sock.sendto(end_packet.raw(), (to_end[0], int(to_end[1])))
+
+    while True:
+        packet_change_event.wait()
+        flag = last_flags
+        packet_change_event.clear()
+        if flag["SYN"] and flag["DONE"] and flag["NOD"]:
+            break
+
+    end_connection(to_end[0] + " " + to_end[1])
+    send_event.set()
 
 
 def send_msg(args):
@@ -530,6 +594,9 @@ def user_interface():
 
         if command[0].lower() == "end" or command[0].lower() == "c":
             end_connection(command[1])
+
+        if command[0].lower() == "cancel" or command[0].lower() == "s":
+            connection_signal_end(command[1])
 
         if command[0].lower() == "down" or command[0].lower() == "cd":
             change_download_directory()
