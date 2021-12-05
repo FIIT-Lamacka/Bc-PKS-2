@@ -386,6 +386,8 @@ def send_msg(args):
     arguments = args.split(" ", maxsplit=2)
 
     send_event.clear()
+    time.sleep(0.5)
+    packet_change_event.clear()
 
     print("\tFragmenting message...")
     msg_frag = fragment_message(arguments[2].encode())
