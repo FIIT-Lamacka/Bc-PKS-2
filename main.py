@@ -181,18 +181,18 @@ def create_file_packets(fragments: list, filename: str) -> list:
 
 def assemble_packets(com_to_assemble: Comm):
 
-    packets = com_to_assemble.packets
-    flags = decypher_packet_flag(packets[0][:2])
+    assembled_packets = com_to_assemble.packets
+    flags = decypher_packet_flag(assembled_packets[0][:2])
     message = b''
     if flags["MSG"]:
-        for packet in packets[1:]:
+        for packet in assembled_packets[1:]:
             message += packet[9:]
 
         locked_print("(", com_to_assemble.ip, ",", str(com_to_assemble.port), ")", message.decode("UTF-8"))
 
     if flags["FILE"]:
         f = open(save_location + com_to_assemble.name.decode("utf-8"), "ab")
-        for packet in packets[1:]:
+        for packet in assembled_packets[1:]:
             f.write(packet[9:])
         f.close()
         locked_print(Fore.GREEN + "File transfer done! \n File saved to" + save_location + Style.RESET_ALL)
@@ -313,7 +313,6 @@ def create_connection(dest_ip, dest_port):
 
     packet_change_event.clear()
     sock.sendto(syn_packet.raw(), (dest_ip, dest_port))
-
     packet_change_event.wait()
     flags = decypher_packet_flag(last_packet[:2])
     packet_change_event.clear()
@@ -327,9 +326,7 @@ def create_connection(dest_ip, dest_port):
     new_connection.ip = dest_ip
     new_connection.port = dest_port
     new_connection.last_hello_time = 0
-
     locked_print("Created new connection!")
-
     connections.append(new_connection)
 
 
@@ -364,10 +361,8 @@ def connection_killer():
         for conn in connections:
             conn.last_hello_time += 1
             if conn.last_hello_time >= 10:
-
                 locked_print(Fore.YELLOW + "No HELLO response from", conn.ip, conn.port, "terminating!"
                              + Style.RESET_ALL)
-
                 to_delete.append(conn)
 
         for dead_connection in to_delete:
@@ -376,8 +371,8 @@ def connection_killer():
 
 def end_connection(connection):
 
-    given_socket = connection.split(" ")
     global connections
+    given_socket = connection.split(" ")
 
     for con in connections:
         if con.ip == given_socket[0] and con.port == int(given_socket[1]):
