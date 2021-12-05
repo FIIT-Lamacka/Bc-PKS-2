@@ -16,29 +16,16 @@ ack_lock = threading.Lock()
 
 send_event = threading.Event()
 packet_change_event = threading.Event()
+
 connections = []
 last_packet = None
 last_socket = ("0", 0)
 last_flags = {"NOD": False, "NNOD": False, "MSG": False, "FILE": False, "TXT": False, "BIN": False, "DONE": False,
-                 "PSH": False, "NAME": False, "SIZE": False, "SYN": False
-                 }
+              "PSH": False, "NAME": False, "SIZE": False, "SYN": False}
 make_errors = False
 
-save_location = "/"
+save_location = ""
 init()
-
-"""
-TODO:
-
--ACK timeout
--Doriesit preco blbne HELLO
--nastavenie prijimacieho adresára
--vypísanie počtu posielaných packetov a veľkosť
--vypísať umiestnenie súborov a kam ukladať
--nazov a absolutna cesta po prijati
--velkost a pocet fragmentov po prijati
-
-"""
 
 
 class PacketDatabase:
@@ -89,8 +76,9 @@ def locked_print(*args, **kwargs):
     global console_lock
 
     console_lock.acquire()
-    print("".join(map(str, args)), **kwargs)
+    print(" ".join(map(str, args)), **kwargs)
     console_lock.release()
+
 
 # ZDROJ: Greenstick - https://stackoverflow.com/questions/3173320/text-progress-bar-in-the-console
 def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=100, fill='█', print_end="\r"):
@@ -128,8 +116,6 @@ def decypher_packet_flag(flag_bytes):
     dict_keys = ["NOD", "NNOD", "MSG", "FILE", "TXT", "BIN", "DONE", "PSH", "NAME", "SIZE", "SYN"]
     keys_iter = 10-16
 
-
-    # flag = int(flag_bytes, 16)
     flag = int.from_bytes(flag_bytes, byteorder="big")
 
     for i in range(17):
@@ -142,7 +128,7 @@ def decypher_packet_flag(flag_bytes):
     return flag_dict
 
 
-def fragment_message(message: bytes) -> list:
+def fragment_data(message: bytes) -> list:
 
     global fragment_size
     return [message[i:i + fragment_size] for i in range(0, len(message), fragment_size)]
@@ -153,21 +139,18 @@ def create_message_packets(fragments: list) -> list:
     packets = []
     i = 1
 
-    header_flag = create_packet_flag(msg=True, size=True)
-    packets.append(Packet(flag=header_flag))
+    packet_flags = create_packet_flag(msg=True, size=True)
+    packets.append(Packet(flag=packet_flags))
 
-    header_flag = create_packet_flag(psh=True, txt=True, msg=True)
+    packet_flags = create_packet_flag(psh=True, txt=True, msg=True)
     for fragment in fragments:
-        # checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
         checksum = zlib.crc32(fragment).to_bytes(4, byteorder="big")
-        new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
-        # new_packet.order = "{0:0{1}x}".format(i, 6).encode()
+        new_packet = Packet(flag=packet_flags, crc=checksum, data=fragment)
         new_packet.order = i.to_bytes(3, byteorder="big")
         i += 1
         packets.append(new_packet)
 
     packets[-1].flag = create_packet_flag(psh=True, txt=True, msg=True, done=True)
-    #packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
     packets[0].order = len(packets).to_bytes(3, byteorder="big")
 
     return packets
@@ -183,16 +166,13 @@ def create_file_packets(fragments: list, filename: str) -> list:
 
     header_flag = create_packet_flag(psh=True, binary=True, file=True)
     for fragment in fragments:
-        # checksum = "{0:0{1}x}".format(zlib.crc32(fragment), 8).encode()
         checksum = zlib.crc32(fragment).to_bytes(4, byteorder="big")
         new_packet = Packet(flag=header_flag, crc=checksum, data=fragment)
-        # new_packet.order = "{0:0{1}x}".format(i, 6).encode()
         new_packet.order = i.to_bytes(3, byteorder="big")
         i += 1
         packets.append(new_packet)
 
     packets[-1].flag = create_packet_flag(psh=True, binary=True, file=True, done=True)
-    #packets[0].order = "{0:0{1}x}".format(len(packets), 6).encode()
     packets[0].order = len(packets).to_bytes(3, byteorder="big")
     packets[0].data = filename.encode()
 
@@ -211,11 +191,11 @@ def assemble_packets(com_to_assemble: Comm):
         locked_print("(", com_to_assemble.ip, ",", str(com_to_assemble.port), ")", message.decode("UTF-8"))
 
     if flags["FILE"]:
-        f = open(com_to_assemble.name, "ab")
+        f = open(save_location + com_to_assemble.name.decode("utf-8"), "ab")
         for packet in packets[1:]:
             f.write(packet[9:])
         f.close()
-        print(Fore.GREEN + "File transfer DONE!" + Style.RESET_ALL)
+        locked_print(Fore.GREEN + "File transfer done! \n File saved to" + save_location + Style.RESET_ALL)
 
 
 def assembler(given_data, given_addr):
@@ -226,7 +206,6 @@ def assembler(given_data, given_addr):
     last_flags = flags
     last_packet = given_data
     last_socket = given_addr
-
 
     if flags["SYN"] and flags["NOD"]:
         global connections
@@ -241,9 +220,7 @@ def assembler(given_data, given_addr):
         return
 
     if flags["SYN"] and flags["NNOD"]:
-        console_lock.acquire()
-        print("Recieved HELLO from", given_addr[0], given_addr[1])
-        console_lock.release()
+        locked_print("Recieved HELLO from", given_addr[0], given_addr[1])
 
         update = threading.Thread(target=connection_update, args=(given_addr[0], given_addr[1]), daemon=True)
         update.start()
@@ -256,17 +233,14 @@ def assembler(given_data, given_addr):
         if local_crc == sender_crc:
             ack_packet = Packet(flag=create_packet_flag(nod=True))
             sock.sendto(ack_packet.raw(), given_addr)
-            console_lock.acquire()
-            print("Received packet", int.from_bytes(given_data[2:5], byteorder="big"), "of size", len(given_data[9:]), "[", Fore.GREEN, "OK", Style.RESET_ALL, "]")
-            console_lock.release()
+            locked_print("Received packet", int.from_bytes(given_data[2:5], byteorder="big"), "of size",
+                         len(given_data[9:]), "[", Fore.GREEN, "OK", Style.RESET_ALL, "]")
 
         else:
             nack_packet = Packet(flag=create_packet_flag(nnod=True))
             sock.sendto(nack_packet.raw(), given_addr)
-            console_lock.acquire()
-            print("Received packet", int.from_bytes(given_data[2:5], byteorder="big"), "of size", len(given_data[9:]), "[", Fore.RED, "ERROR", Style.RESET_ALL, "]")
-            console_lock.release()
-            # print(Fore.RED + "CRC Error! Sending packet resend request." + Style.RESET_ALL)
+            locked_print("Received packet", int.from_bytes(given_data[2:5], byteorder="big"), "of size",
+                         len(given_data[9:]), "[", Fore.RED, "ERROR", Style.RESET_ALL, "]")
             packet_change_event.set()
             return
 
@@ -307,6 +281,7 @@ def assembler(given_data, given_addr):
             break
     packet_change_event.set()
 
+
 def recieve_mode():
 
     global ip, port, sock
@@ -316,7 +291,8 @@ def recieve_mode():
         except ConnectionResetError:
 
             console_lock.acquire()
-            print(Fore.RED + "\nThe program has encountered a connection error, please restart the program!" + Style.RESET_ALL)
+            print(Fore.RED + "\nThe program has encountered a connection error, please restart the program!"
+                  + Style.RESET_ALL)
             input()
             exit()
             return
@@ -329,9 +305,7 @@ def create_connection(dest_ip, dest_port):
 
     for con in connections:
         if con.ip == dest_ip and con.port == dest_port:
-            console_lock.acquire()
-            print("Connection already established")
-            console_lock.release()
+            locked_print("Connection already established")
             return
 
     packet_flag = create_packet_flag(syn=True, nod=True)
@@ -343,8 +317,7 @@ def create_connection(dest_ip, dest_port):
     packet_change_event.wait()
     flags = decypher_packet_flag(last_packet[:2])
     packet_change_event.clear()
-    #flags = decypher_packet_flag(create_packet_flag())
-    print(flags)
+
     while not flags["SYN"] and last_socket[0] == dest_ip and int(last_socket[1]) == dest_port:
         packet_change_event.wait()
         flags = decypher_packet_flag(last_packet[:2])
@@ -354,9 +327,9 @@ def create_connection(dest_ip, dest_port):
     new_connection.ip = dest_ip
     new_connection.port = dest_port
     new_connection.last_hello_time = 0
-    console_lock.acquire()
-    print("Created new connection!")
-    console_lock.release()
+
+    locked_print("Created new connection!")
+
     connections.append(new_connection)
 
 
@@ -369,15 +342,15 @@ def connection_hello():
         for conn in connections:
             hello_packet = Packet(flag=create_packet_flag(syn=True, nnod=True))
             sock.sendto(hello_packet.raw(), (conn.ip, conn.port))
-            console_lock.acquire()
-            print("Sending hello to:", conn.ip,  conn.port)
-            console_lock.release()
+
+            locked_print("Sending hello to:", conn.ip,  conn.port)
 
 
-def connection_update(ip, port):
+def connection_update(given_ip, given_port):
+
     global connections
     for con in connections:
-        if con.ip == ip and con.port == port:
+        if con.ip == given_ip and con.port == given_port:
             con.last_hello_time = 0
 
 
@@ -391,16 +364,31 @@ def connection_killer():
         for conn in connections:
             conn.last_hello_time += 1
             if conn.last_hello_time >= 10:
-                console_lock.acquire()
-                print(Fore.YELLOW + "No HELLO response from", conn.ip, conn.port, "terminating!" + Style.RESET_ALL)
-                console_lock.release()
+
+                locked_print(Fore.YELLOW + "No HELLO response from", conn.ip, conn.port, "terminating!"
+                             + Style.RESET_ALL)
+
                 to_delete.append(conn)
 
         for dead_connection in to_delete:
             connections.remove(dead_connection)
 
 
+def end_connection(connection):
+
+    given_socket = connection.split(" ")
+    global connections
+
+    for con in connections:
+        if con.ip == given_socket[0] and con.port == int(given_socket[1]):
+            locked_print("Removing " + connection + "connection!")
+            connections.remove(con)
+            return
+    locked_print("Connection not found!")
+
+
 def send_msg(args):
+
     global last_packet, sock
     arguments = args.split(" ", maxsplit=2)
 
@@ -408,25 +396,16 @@ def send_msg(args):
     time.sleep(0.5)
     packet_change_event.clear()
 
-    console_lock.acquire()
-    print("\tFragmenting message...")
-    console_lock.release()
-
-    msg_frag = fragment_message(arguments[2].encode())
+    locked_print("\tFragmenting message...")
+    msg_frag = fragment_data(arguments[2].encode())
     msg_frag = create_message_packets(msg_frag)
     packet_no = 0
     total_packets_len = len(msg_frag)
 
-    console_lock.acquire()
-    print("\tEstablishing connection: ", end="")
-    console_lock.release()
-
+    locked_print("\tEstablishing connection: ", end="")
     create_connection(arguments[0], int(arguments[1]))
 
-    console_lock.acquire()
-    print("\tSending message...")
-    console_lock.release()
-
+    locked_print("\tSending message...")
     for frag in msg_frag:
         packet_no += 1
 
@@ -439,9 +418,9 @@ def send_msg(args):
         nnod_counter = 0
         while flags["NNOD"]:
             if nnod_counter == 3:
-                console_lock.acquire()
-                print(Fore.RED + "\tMESSAGE NOT SENT!" + Style.RESET_ALL)
-                console_lock.release()
+
+                locked_print(Fore.RED + "\tMESSAGE NOT SENT!" + Style.RESET_ALL)
+
                 send_event.set()
                 return
 
@@ -453,9 +432,9 @@ def send_msg(args):
         console_lock.acquire()
         print_progress_bar(packet_no, total_packets_len)
         console_lock.release()
-    console_lock.acquire()
-    print(Fore.GREEN + "\n\tMESSAGE SENT SUCCESFULLY!" + Style.RESET_ALL)
-    console_lock.release()
+
+    locked_print(Fore.GREEN + "\n\tMESSAGE SENT SUCCESFULLY!" + Style.RESET_ALL)
+
     send_event.set()
 
 
@@ -475,31 +454,23 @@ def send_file(args):
 
     with open(file_path, "rb") as file:
         byte = file.read()
-        file_fragments = fragment_message(byte)
+        file_fragments = fragment_data(byte)
 
-    console_lock.acquire()
-    print(Fore.GREEN + "\tFile loaded succesfuly...." + Style.RESET_ALL)
-    console_lock.release()
+    locked_print(Fore.GREEN + "\tFile loaded succesfuly...." + Style.RESET_ALL)
 
     filename = file_path.split("/")[-1]
 
-    console_lock.acquire()
-    print("\tFragmenting file...")
-    console_lock.release()
+    locked_print("\tFragmenting file...")
 
     file_frag = create_file_packets(file_fragments, filename)
     packet_no = 0
     total_packets_len = len(file_frag)
 
-    console_lock.acquire()
-    print("\tEstablishing connection: ", end="")
-    console_lock.release()
+    locked_print("\tEstablishing connection: ", end="")
 
     create_connection(arguments[0], int(arguments[1]))
 
-    console_lock.acquire()
-    print("\tSending file: ", file_path, "\n\t", len(file_frag), "packet(s) of", fragment_size, "bytes\n")
-    console_lock.acquire()
+    locked_print("\tSending file: ", file_path, "\n\t", len(file_frag), "packet(s) of", fragment_size, "bytes\n")
 
     for frag in file_frag:
         packet_no += 1
@@ -510,7 +481,7 @@ def send_file(args):
         nnod_counter = 0
         while flags["NNOD"]:
             if nnod_counter == 3:
-                print(Fore.RED + "\tFILE NOT SENT!" + Style.RESET_ALL)
+                locked_print(Fore.RED + "\tFILE NOT SENT!" + Style.RESET_ALL)
                 send_event.set()
                 return
 
@@ -519,16 +490,27 @@ def send_file(args):
             packet_change_event.wait(timeout=2.0)
             flags = decypher_packet_flag(last_packet[:2])
             packet_change_event.clear()
-
+        console_lock.acquire()
         print_progress_bar(packet_no, total_packets_len)
-    print(Fore.GREEN + "\n\tFILE SENT SUCCESFULLY!" + Style.RESET_ALL)
+        console_lock.release()
+
+    locked_print(Fore.GREEN + "\n\tFILE SENT SUCCESFULLY!" + Style.RESET_ALL)
     send_event.set()
+
+
+def change_download_directory():
+    global save_location
+
+    root = tk.Tk()
+    root.withdraw()
+    save_location = filedialog.askdirectory() + "/"
+    locked_print(Fore.GREEN + "NEW SAVE LOCATION: " + save_location + Style.RESET_ALL)
 
 
 def user_interface():
     while True:
         global ip, port, mode
-        print(Fore.CYAN + "INPUT COMMANDS:\n" + Style.RESET_ALL)
+        locked_print(Fore.CYAN + "INPUT COMMANDS:\n" + Style.RESET_ALL)
         command = input("").split(" ", maxsplit=1)
 
         if command[0].lower() == "fragment" or command[0].lower() == "fr":
@@ -543,7 +525,7 @@ def user_interface():
                 while selected_size < 1 or selected_size > 1472:
                     selected_size = int(input("Zadajte veľkosť fragmentu od 1B po 1472B: "))
                 fragment_size = selected_size
-            print("FRAGMENT SIZE IS SET TO ", fragment_size)
+            locked_print("FRAGMENT SIZE IS SET TO ", fragment_size)
 
         if command[0].lower() == "file" or command[0].lower() == "f":
             send_file(command[1])
@@ -551,15 +533,21 @@ def user_interface():
         if command[0].lower() == "message" or command[0].lower() == "m":
             send_msg(command[1])
 
+        if command[0].lower() == "end" or command[0].lower() == "c":
+            end_connection(command[1])
+
+        if command[0].lower() == "down" or command[0].lower() == "cd":
+            change_download_directory()
+
         if command[0].lower() == "error" or command[0].lower() == "e":
             global make_errors
             if make_errors:
                 make_errors = False
-                print("Errors have been turned off.")
+                locked_print("Errors have been turned off.")
 
             else:
                 make_errors = True
-                print(Fore.YELLOW + "DELIBERATE ERRORS HAVE BEEN TURNED ON!" + Style.RESET_ALL)
+                locked_print(Fore.YELLOW + "DELIBERATE ERRORS HAVE BEEN TURNED ON!" + Style.RESET_ALL)
 
 
 def hub():
@@ -575,14 +563,14 @@ def hub():
 
     user_interface()
 
+
 if __name__ == '__main__':
 
     mode = "receive"
     fragment_size = 1472
     ip = "127.0.0.1"
 
-
-    print(Fore.CYAN + "SET PORT: " + Style.RESET_ALL, end="")
+    locked_print(Fore.CYAN + "SET PORT: " + Style.RESET_ALL, end="")
     port = input("")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
