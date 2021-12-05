@@ -35,7 +35,6 @@ TODO:
 -nastavenie prijimacieho adresára
 -vypísanie počtu posielaných packetov a veľkosť
 -vypísať umiestnenie súborov a kam ukladať
--vypísanie fragmentu s poradím a či prešiel bez chyb
 -nazov a absolutna cesta po prijati
 -velkost a pocet fragmentov po prijati
 
@@ -251,21 +250,21 @@ def assembler(given_data, given_addr):
             ack_packet = Packet(flag=create_packet_flag(nod=True))
             sock.sendto(ack_packet.raw(), given_addr)
             console_lock.acquire()
-            print("ACK", int.from_bytes(local_crc, byteorder="big"), int.from_bytes(sender_crc, byteorder="big"))
+            print("Received packet", int.from_bytes(given_data[2:5], byteorder="big"), "of size", len(given_data[9:]), "[", Fore.GREEN, "OK", Style.RESET_ALL, "]")
             console_lock.release()
 
         else:
             nack_packet = Packet(flag=create_packet_flag(nnod=True))
             sock.sendto(nack_packet.raw(), given_addr)
             console_lock.acquire()
-            print(Fore.RED + "NACK", int.from_bytes(local_crc, byteorder="big"), int.from_bytes(sender_crc, byteorder="big"), Style.RESET_ALL)
+            print("Received packet", int.from_bytes(given_data[2:5], byteorder="big"), "of size", len(given_data[9:]), "[", Fore.RED, "ERROR", Style.RESET_ALL, "]")
             console_lock.release()
             # print(Fore.RED + "CRC Error! Sending packet resend request." + Style.RESET_ALL)
             packet_change_event.set()
             return
 
     if flags["SIZE"] and flags["MSG"]:
-        hello_lock.acquire()
+        send_event.clear()
         ack_packet = Packet(flag=create_packet_flag(nod=True))
         sock.sendto(ack_packet.raw(), given_addr)
 
@@ -277,7 +276,7 @@ def assembler(given_data, given_addr):
             if com.ip == given_addr[0] and com.port == given_addr[1]:
                 com.packets.append(given_data)
             if flags["DONE"]:
-                hello_lock.release()
+                send_event.set()
                 assemble_packets(com)
                 packet_database.comms.remove(com)
             break
@@ -358,7 +357,6 @@ def connection_hello():
             print("Sending hello to:", conn.ip,  conn.port)
 
 
-
 def connection_update(ip, port):
     global connections
     for con in connections:
@@ -435,6 +433,8 @@ def send_file(args):
     file_path = filedialog.askopenfilename()
 
     send_event.clear()
+    time.sleep(0.5)
+    packet_change_event.clear()
 
     with open(file_path, "rb") as file:
         byte = file.read()
@@ -446,7 +446,6 @@ def send_file(args):
     file_frag = create_file_packets(file_fragments, filename)
     packet_no = 0
     total_packets_len = len(file_frag)
-
 
     print("\tEstablishing connection: ", end="")
     create_connection(arguments[0], int(arguments[1]))
